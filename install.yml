@@ -1,0 +1,99 @@
+---
+- name: Install OCP
+  hosts: 127.0.0.1
+  connection: local
+  vars_prompt:
+  - name: "public_ip"
+    prompt: "Informe o ip public da sua instancia"
+    private: no
+  tasks:
+    - name: Install docker and other packages
+      yum: name={{item}} state=latest
+      with_items:
+        - wget
+        - git
+        - net-tools
+        - bind-utils
+        - iptables-services
+        - bridge-utils
+        - bash-completion
+        - vim
+        - docker
+        - python-rhsm-certificates
+      
+    - name: Add insecure-registry to /etc/sysconfig/docker
+      lineinfile: dest=/etc/sysconfig/docker backup=yes regexp=^OPTIONS= line=OPTIONS='--selinux-enabled --insecure-registry 172.30.0.0/16 --log-opt max-size=1M --log-opt max-file=3 --signature-verification=false'
+
+    - name: Start docker and enable it on boot
+      service: name=docker enabled=yes state=started
+
+    - name: Bringing cluster down if necessary
+      shell: oc cluster down
+
+    - name: Umount some tmpfs
+      shell: for x in $(mount | grep "tmpfs on /var/lib/origin" | awk '{print $3}'); do umount $x; done
+
+    - name: Cleaning environment before installing openshift
+      file:
+        state: absent
+        path: "/var/lib/origin/"
+
+    - name: Run oc cluster up (it may take a while...)
+      shell: oc cluster up --version=v3.7.23 --public-hostname={{public_ip}}  --host-data-dir=/var/lib/origin/openshift.local.etcd --host-config-dir=/var/lib/origin/openshift.local.config --host-pv-dir=/var/lib/origin/openshift.local.pv --metrics --logging
+      register: oc_cluster_up_msg
+
+    - name: OpenShift Login
+      shell: oc login -u system:admin --insecure-skip-tls-verify
+      
+    - name: Get Metrics Pod
+      shell: oc get pods -n openshift-infra | grep openshift-ansible-metrics | head -n1 | cut -d' ' -f1
+      register: metrics_pod
+      until: metrics_pod.stdout != ""
+      retries: 20
+      delay: 30
+
+    - name: Get Logging Pod
+      shell: oc get pods -n logging | grep openshift-ansible-logging | head -n1 | cut -d' ' -f1
+      register: logging_pod
+      until: logging_pod.stdout != ""
+      retries: 20
+      delay: 30
+    
+    - name: Fix permissions
+      shell: oc adm policy add-cluster-role-to-user cluster-read -z openshift-ansible -n openshift-infra
+
+    - name: Fix Metrics Deployment Red Hat (it may take a while...)
+      shell: oc debug {{ metrics_pod.stdout }} -n openshift-infra -- /usr/bin/bash -c \
+              "yum install hostname -y &&
+               yum-config-manager --enable rhel-7-server-ose-3.7-rpms &&
+               ansible-playbook -i /tmp/inventory playbooks/byo/openshift-cluster/openshift-metrics.yml"
+      when: ansible_distribution == 'Red Hat Enterprise Linux'
+      async: 900
+      poll: 30
+
+    - name: Fix Metrics Deployment CentOS (it may take a while...)
+      shell: >
+        oc debug "{{ metrics_pod.stdout }}" -n openshift-infra -- /usr/bin/bash -c "sed -i 's/- include: validate_hostnames.yml/#- include: validate_hostnames.yml/' /usr/share/ansible/openshift-ansible/playbooks/common/openshift-cluster/std_include.yml &&  ansible-playbook -i /tmp/inventory playbooks/byo/openshift-cluster/openshift-metrics.yml"
+      when: ansible_distribution == 'CentOS'
+      
+    - name: Fix Logging Deployment (it may take a while...)
+      shell: oc debug {{ logging_pod.stdout }} -n logging -- /usr/bin/bash -c \
+              "yum-config-manager --enable rhel-7-server-extras-rpms &&
+               yum-config-manager --enable rhel-7-server-ose-3.7-rpms &&
+               yum install ansible hostname -y &&
+               ansible-playbook -i /tmp/inventory playbooks/byo/openshift-cluster/openshift-logging.yml"
+      when: ansible_distribution == 'Red Hat Enterprise Linux'
+
+    - name: Find The Logging Deployment Config
+      shell: oc get dc -o jsonpath='{.items[*].metadata.name}{"\n"}' -n logging -l 'component=es'
+      register: logging_dc
+
+    - name: Find The Correct Logging Image
+      shell: oc get dc {{ logging_dc.stdout }} -n logging \
+              -o jsonpath='{.spec.template.spec.containers[0].image}' | sed -e "s/ose-//g"
+      register: logging_image
+
+    - name: Fix Logging Data Master Image
+      shell: |
+        oc patch dc/{{ logging_dc.stdout }} -n logging \
+          -p '{"spec": {"template": {"spec": {"containers":[{"name": "proxy", "image": "{{ logging_image.stdout }}"}]}}}}'
