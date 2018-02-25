@@ -27,6 +27,14 @@
     - name: Start docker and enable it on boot
       service: name=docker enabled=yes state=started
 
+    - name: Checking if OC is installed
+      shell: oc
+      register: oc_exist
+
+#    - debug:
+#        msg: "oc não está instalado/configurado no seu ambiente. Para instalar, siga instruções abaixo: \n\n * CentOS:https://github.com/openshift/origin/releases/download/v3.7.1/openshift-origin-client-tools-v3.7.1-ab0f056-linux-64bit.tar.gz \n* RedHat: https://access.redhat.com/downloads/content/290/ver=3.7/rhel---7/3.7.23/x86_64/product-software\n\nQualquer dúvida fale com o instrutor!"
+#      when: oc_exist.rc != 0
+
     - name: Bringing cluster down if necessary
       shell: oc cluster down
 
@@ -59,7 +67,7 @@
       retries: 20
       delay: 30
     
-    - name: Fix permissions
+    - name: Fix permissions metrics
       shell: oc adm policy add-cluster-role-to-user cluster-read -z openshift-ansible -n openshift-infra
 
     - name: Fix Metrics Deployment Red Hat (it may take a while...)
@@ -69,12 +77,23 @@
                ansible-playbook -i /tmp/inventory playbooks/byo/openshift-cluster/openshift-metrics.yml"
       when: ansible_distribution == 'Red Hat Enterprise Linux'
       async: 900
-      poll: 30
+      poll: 15
+
+    - name: Fix inventory metrics
+      shell:  sed -i 's/openshift-enterprise/origin/' /var/lib/origin/openshift.local.config/metrics.inventory
+      when: ansible_distribution == 'CentOS'
+
+    - name: Fix inventory logging
+      shell:  sed -i 's/openshift-enterprise/origin/' /var/lib/origin/openshift.local.config/logging.inventory
+      when: ansible_distribution == 'CentOS'
 
     - name: Fix Metrics Deployment CentOS (it may take a while...)
       shell: >
-        oc debug "{{ metrics_pod.stdout }}" -n openshift-infra -- /usr/bin/bash -c "sed -i 's/- include: validate_hostnames.yml/#- include: validate_hostnames.yml/' /usr/share/ansible/openshift-ansible/playbooks/common/openshift-cluster/std_include.yml &&  ansible-playbook -i /tmp/inventory playbooks/byo/openshift-cluster/openshift-metrics.yml"
+        oc debug "{{ metrics_pod.stdout }}" -n openshift-infra -- /usr/bin/bash -c \
+        "sed -i 's/- include: validate_hostnames.yml/#- include: validate_hostnames.yml/' /usr/share/ansible/openshift-ansible/playbooks/common/openshift-cluster/std_include.yml && /usr/bin/echo -e '[centos]\nname=CentOS \$releasever - \$basearch\nbaseurl=http://ftp.heanet.ie/pub/centos/7/os/\$basearch/\nenabled=1\ngpgcheck=0' > /etc/yum.repos.d/centos.repo && yum install hostname -y && ansible-playbook -i /tmp/inventory playbooks/byo/openshift-cluster/openshift-metrics.yml"
       when: ansible_distribution == 'CentOS'
+      async: 900
+      poll: 15
       
     - name: Fix Logging Deployment (it may take a while...)
       shell: oc debug {{ logging_pod.stdout }} -n logging -- /usr/bin/bash -c \
@@ -83,6 +102,15 @@
                yum install ansible hostname -y &&
                ansible-playbook -i /tmp/inventory playbooks/byo/openshift-cluster/openshift-logging.yml"
       when: ansible_distribution == 'Red Hat Enterprise Linux'
+
+    - name: Fix permissions logging
+      shell: oc adm policy add-cluster-role-to-user cluster-admin -z openshift-ansible -n logging
+
+    - name: Fix Logging Deployment CentoOS (it may take a while...)
+      shell: >
+        oc debug {{ logging_pod.stdout }} -n logging -- /usr/bin/bash -c \
+        "sed -i 's/- include: validate_hostnames.yml/#- include: validate_hostnames.yml/' /usr/share/ansible/openshift-ansible/playbooks/common/openshift-cluster/std_include.yml && /usr/bin/echo -e '[centos]\nname=CentOS \$releasever - \$basearch\nbaseurl=http://ftp.heanet.ie/pub/centos/7/os/\$basearch/\nenabled=1\ngpgcheck=0' > /etc/yum.repos.d/centos.repo && yum install hostname -y && yum localinstall -y yum localinstall -y https://rpmfind.net/linux/centos/7.4.1708/extras/x86_64/Packages/python2-jmespath-0.9.0-3.el7.noarch.rpm && yum localinstall -y https://rpmfind.net/linux/centos/7.4.1708/extras/x86_64/Packages/ansible-2.4.2.0-2.el7.noarch.rpm && ansible-playbook -i /tmp/inventory playbooks/byo/openshift-cluster/openshift-logging.yml"
+      when: ansible_distribution == 'CentOS'
 
     - name: Find The Logging Deployment Config
       shell: oc get dc -o jsonpath='{.items[*].metadata.name}{"\n"}' -n logging -l 'component=es'
@@ -93,7 +121,12 @@
               -o jsonpath='{.spec.template.spec.containers[0].image}' | sed -e "s/ose-//g"
       register: logging_image
 
+    - name: Fix request and limits for es
+      shell: |
+        oc patch dc/{{ logging_dc.stdout }} -n logging -p '{"spec": {"template": {"spec": {"containers":[{"name": "elasticsearch", "image": "{{ logging_image.stdout }}", "resources":  { "limits": { "memory": "2Gi" }, "requests": { "memory": "1Gi", "cpu": "500m"}}}]}}}}'
+
     - name: Fix Logging Data Master Image
       shell: |
         oc patch dc/{{ logging_dc.stdout }} -n logging \
           -p '{"spec": {"template": {"spec": {"containers":[{"name": "proxy", "image": "{{ logging_image.stdout }}"}]}}}}'
+    
