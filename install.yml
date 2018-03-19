@@ -105,6 +105,7 @@
 
     - name: Fix permissions logging
       shell: oc adm policy add-cluster-role-to-user cluster-admin -z openshift-ansible -n logging
+      when: ansible_distribution == 'CentOS'
 
     - name: Fix Logging Deployment CentoOS (it may take a while...)
       shell: >
@@ -122,6 +123,7 @@
       register: logging_image
 
     - name: Fix request and limits for es
+      when: ansible_distribution == 'CentOS'
       shell: |
         oc patch dc/{{ logging_dc.stdout }} -n logging -p '{"spec": {"template": {"spec": {"containers":[{"name": "elasticsearch", "image": "{{ logging_image.stdout }}", "resources":  { "limits": { "memory": "2Gi" }, "requests": { "memory": "1Gi", "cpu": "500m"}}}]}}}}'
 
@@ -130,3 +132,8 @@
         oc patch dc/{{ logging_dc.stdout }} -n logging \
           -p '{"spec": {"template": {"spec": {"containers":[{"name": "proxy", "image": "{{ logging_image.stdout }}"}]}}}}'
     
+    - name: Install xpaas images
+      shell: oc create -f {{item}} -n openshift
+      with_items:
+        - https://raw.githubusercontent.com/openshift/openshift-ansible/master/roles/openshift_examples/files/examples/v3.7/xpaas-streams/jboss-image-streams.json
+        - https://raw.githubusercontent.com/openshift/openshift-ansible/master/roles/openshift_examples/files/examples/v3.7/xpaas-streams/fis-image-streams.json
